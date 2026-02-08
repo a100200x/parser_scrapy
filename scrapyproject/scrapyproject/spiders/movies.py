@@ -9,14 +9,15 @@ class MoviesSpider(scrapy.Spider):
         super().__init__(*args, **kwargs)
         self.processed_count = 0
         self.error_count = 0
+
     name = "movies"
-    allowed_domains = ["ru.wikipedia.org"]
+    allowed_domains = ["ru.wikipedia.org", "imdb.com"]
     custom_settings = {
         'FEEDS': {
-            'movies.csv': {
+            'movies_with_rating.csv': {
                 'format': 'csv',
                 'encoding': 'utf-8-sig',
-                'fields': ['name', 'genre', 'director', 'country', 'year',],
+                'fields': ['name', 'genre', 'director', 'country', 'year', 'rating'],
                 'overwrite': True
             }
         },
@@ -25,12 +26,13 @@ class MoviesSpider(scrapy.Spider):
         'DEPTH_PRIORITY': 1,
         'SCHEDULER_DISK_QUEUE': 'scrapy.squeues.PickleFifoDiskQueue',
         'SCHEDULER_MEMORY_QUEUE': 'scrapy.squeues.FifoMemoryQueue',
+        'USER_AGENT': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
     }
 
     def start_requests(self):
         url = "https://ru.wikipedia.org/wiki/%D0%9A%D0%B0%D1%82%D0%B5%D0%B3%D0%BE%D1%80%D0%B8%D1%8F:%D0%A4%D0%B8%D0%BB%D1%8C%D0%BC%D1%8B_%D0%BF%D0%BE_%D0%B0%D0%BB%D1%84%D0%B0%D0%B2%D0%B8%D1%82%D1%83"
         print("Парсер запущен. Можно остановить Ctrl+C . \n"
-              "Список фильмов сохранится в файл .csv в папке spiders ")
+              "Список фильмов сохранится в файл movies_new.csv")
         yield scrapy.Request(url=url, callback=self.parse)
 
     def parse(self, response):
@@ -44,17 +46,18 @@ class MoviesSpider(scrapy.Spider):
                 )
 
         # Переход на следующую страницу категории
-        next_page = response.css(
-            '#mw-pages a:contains("Следующая страница")::attr(href)').get()
-        if next_page:
-            next_url = response.urljoin(next_page)
-            yield response.follow(next_url, callback=self.parse)
-        else:
-            print(f"-------Завершено")
-            self.logger.info("Last page")
+        # next_page = response.css(
+        #     '#mw-pages a:contains("Следующая страница")::attr(href)').get()
+        # if next_page:
+        #     next_url = response.urljoin(next_page)
+        #     yield response.follow(next_url, callback=self.parse)
+        # else:
+        #     print(f"-------Завершено")
+        #     self.logger.info("Last page")
 
     def parse_movie_details(self, response):
         """Парсинг детальной страницы фильма"""
+        import re
 
         name = response.css('h1#firstHeading .mw-page-title-main::text').get()
         if not name:
@@ -62,9 +65,13 @@ class MoviesSpider(scrapy.Spider):
         if not name:
             name = response.meta.get('movie_name', '')
         if name:
-            import re
             name = re.sub(r'<[^>]+>', '', name)  # Убираем HTML теги
             name = re.sub(r'\s+', ' ', name).strip()  # Убираем лишние пробелы
+
+        # Вывод прогресса в терминал
+        sys.stdout.write(
+            f"\rПарсим фильм: {name[:50]}...{' ' * 50}")
+        sys.stdout.flush()
 
         info_box = response.css('.infobox')
 
@@ -86,7 +93,6 @@ class MoviesSpider(scrapy.Spider):
                     'th:contains("Жанры") + td::text').get()
             if genre_text:
                 # Разбиваем текст по запятым и другим разделителям
-                import re
                 genre_raw = [g.strip() for g in re.split(
                     r'[,;]', genre_text) if g.strip()]
 
@@ -191,6 +197,7 @@ class MoviesSpider(scrapy.Spider):
                     break
 
         # Год
+        year = None
         year_links = info_box.css(
             'th:contains("Год") + td .dtstart::text').getall()
 
@@ -198,7 +205,6 @@ class MoviesSpider(scrapy.Spider):
             year_links = info_box.css(
                 'th:contains("Год") + td a::text').getall()
 
-        import re
         for link_text in year_links:
             # Ищем 4 цифры подряд (год)
             match = re.search(r'\b(19|20)\d{2}\b', link_text)
@@ -212,17 +218,55 @@ class MoviesSpider(scrapy.Spider):
         def clean_text(text):
             return text.strip() if text else None
 
-        sys.stdout.write(
-            f"\rПарсим фильм: {name}                                      ")
-        sys.stdout.flush()
-
-        yield {
+        movie_data = {
             'name': name if name else "Moovie_Name",
-            'url': response.url,
             'genre': ', '.join(clean_text_list(genre)) if genre else "Genre",
             'director': director if director else 'Director',
             'country': country if country else "Country",
             'year': clean_text(year) if year else "YEAR",
-            'category_page': response.meta.get('category_page', ''),
-            'scraped_at': datetime.datetime.now().isoformat()
         }
+
+        # Ищем ссылку на IMDB
+        imdb_url = info_box.css(
+            'th:contains("IMDb") + td a[href*="imdb.com"]::attr(href)').get()
+        if not imdb_url:
+            imdb_url = info_box.xpath(
+                './/th[contains(., "IMDb")]/following-sibling::td[1]//a[contains(@href, "imdb.com")]/@href').get()
+
+        if imdb_url:
+            yield scrapy.Request(
+                url=imdb_url,
+                callback=self.parse_imdb,
+                meta={'movie_data': movie_data}
+            )
+        else:
+            # Если нет ссылки на IMDB, сохраняем без рейтинга
+            movie_data['rating'] = "No_IMDB_link"
+            yield movie_data
+
+    def parse_imdb(self, response):
+        rating = response.css(
+            'div[data-testid="hero-rating-bar__aggregate-rating__score"] span.sc-4dc495c1-1::text').get()
+
+        if not rating:
+            rating = response.css('span.sc-4dc495c1-1.lbQcRY::text').get()
+
+        if not rating:
+            rating = response.css(
+                'div[data-testid="hero-rating-bar__aggregate-rating"] span.sc-4dc495c1-1::text').get()
+
+        if rating:
+            rating = rating.strip()
+        else:
+            rating = "N/A"
+
+        movie_data = response.meta['movie_data']
+        movie_data['rating'] = rating
+        movie_name = movie_data.get('name', 'Без названия')
+        display_name = movie_name[:30] if movie_name else 'Без названия'
+
+        sys.stdout.write(
+            f"\rПарсим рейтинг: {display_name}...{' ' * 30}")
+        sys.stdout.flush()
+
+        yield movie_data
